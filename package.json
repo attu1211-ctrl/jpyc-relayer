@@ -1,0 +1,16 @@
+{
+  "name": "jpyc-relayer",
+  "version": "1.0.0",
+  "description": "JPYC EIP-3009 ガスレス決済リレーヤー",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0",
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5",
+    "cors": "^2.8.5"
+  }
+}

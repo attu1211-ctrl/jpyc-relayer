@@ -1,8 +1,9 @@
 /**
- * JPYC Relayer Server v2.1.2
+ * JPYC Relayer Server v2.2.0
  * - JPYC_CONTRACT を環境変数化
  * - verifyTypedData で署名者復元チェック
  * - 形式検証・chainId確認・validBefore期限チェック追加
+ * - MassCon distribute() 自動実行追加（v2.2.0）
  */
 
 const express    = require('express');
@@ -24,14 +25,22 @@ const RPC_URL      = process.env.RPC_URL      || 'https://polygon-mainnet.g.alch
 const JPYC_CONTRACT = process.env.JPYC_CONTRACT;
 if (!JPYC_CONTRACT) throw new Error('[FATAL] JPYC_CONTRACT が未設定です。Render.comの環境変数に設定してください');
 
+// ★ MassCon 分配コントラクトアドレス
+const MASSCON_CONTRACT = '0x7486c9bae66ff8c227d83113315e8c02d7abe561';
+
 // 起動時に必須チェック
-if (!RELAYER_PK)   throw new Error('[FATAL] RELAYER_PK が未設定です');
+if (!RELAYER_PK)    throw new Error('[FATAL] RELAYER_PK が未設定です');
 if (!JPYC_CONTRACT) throw new Error('[FATAL] JPYC_CONTRACT が未設定です');
 
 const POLYGON_CHAIN_ID = 137n;
 
 const JPYC_ABI = [
     "function transferWithAuthorization(address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce, uint8 v, bytes32 r, bytes32 s) external"
+];
+
+// ★ MassCon ABI（distribute関数のみ）
+const MASSCON_ABI = [
+    "function distribute() external"
 ];
 
 // ============================================================
@@ -49,8 +58,8 @@ function authMiddleware(req, res, next) {
 // ============================================================
 // 形式検証ヘルパー
 // ============================================================
-function isAddress(v)  { return typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v); }
-function isBytes32(v)  { return typeof v === 'string' && /^0x[0-9a-fA-F]{64}$/.test(v); }
+function isAddress(v)   { return typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v); }
+function isBytes32(v)   { return typeof v === 'string' && /^0x[0-9a-fA-F]{64}$/.test(v); }
 function isBytes32Hex(v){ return typeof v === 'string' && /^0x[0-9a-fA-F]{64}$/.test(v); }
 
 // ============================================================
@@ -60,10 +69,15 @@ app.get('/health', async (req, res) => {
     try {
         const provider = new ethers.JsonRpcProvider(RPC_URL);
         const network  = await provider.getNetwork();
+        const wallet   = new ethers.Wallet(RELAYER_PK, provider);
+        const polBalance = ethers.formatEther(await provider.getBalance(wallet.address));
         res.json({
-            status:   'ok',
-            network:  `Polygon (chainId: ${network.chainId})`,
-            contract: JPYC_CONTRACT,
+            status:    'ok',
+            relayer:   wallet.address,
+            polBalance: polBalance,
+            network:   `Polygon (chainId: ${network.chainId})`,
+            contract:  JPYC_CONTRACT,
+            masscon:   MASSCON_CONTRACT,
         });
     } catch (e) {
         res.status(500).json({ status: 'error', message: e.message });
@@ -76,6 +90,7 @@ app.get('/health', async (req, res) => {
 app.post('/relay', authMiddleware, async (req, res) => {
 
     const { from, to, amount, value, nonce, validBefore, v, r, s } = req.body;
+
     // amount と value の同時指定禁止
     if (amount !== undefined && value !== undefined) {
         return res.status(400).json({ success: false, error: 'amount と value はどちらか一方のみ指定してください' });
@@ -125,7 +140,7 @@ app.post('/relay', authMiddleware, async (req, res) => {
     console.log('[RELAY] 実行前パラメータ確認');
     console.log('  contract    :', JPYC_CONTRACT);
     console.log('  from        :', from);
-    console.log('  to          :', to);
+    console.log('  to          :', to, '← MassConアドレスであること');
     console.log('  value(wei)  :', safeBigValue.toString(), '← 加工なし');
     console.log('  validAfter  :', 0);
     console.log('  validBefore :', safeValidBefore, '(残り', safeValidBefore - nowSec, '秒)');
@@ -176,8 +191,6 @@ app.post('/relay', authMiddleware, async (req, res) => {
 
         if (recoveredAddress.toLowerCase() !== from.toLowerCase()) {
             console.error('[RELAY] ❌ 署名者不一致!');
-            console.error('  recovered:', recoveredAddress);
-            console.error('  from     :', from);
             return res.status(400).json({
                 success: false,
                 error: `署名者不一致: recovered=${recoveredAddress} / from=${from}`,
@@ -185,30 +198,61 @@ app.post('/relay', authMiddleware, async (req, res) => {
         }
         console.log('[RELAY] ✅ 署名者一致確認OK');
 
-        // ⑧ コントラクト実行
+        // ⑧ transferWithAuthorization 実行（→ MassConへ送金）
         const wallet   = new ethers.Wallet(RELAYER_PK, provider);
         const contract = new ethers.Contract(JPYC_CONTRACT, JPYC_ABI, wallet);
 
         const gasEstimate = await contract.transferWithAuthorization.estimateGas(
             from, to, safeBigValue, 0, safeValidBefore, safeNonce, safeV, safeR, safeS
         );
-        console.log('[RELAY] ガス見積もり:', gasEstimate.toString());
+        console.log('[RELAY] ガス見積もり(transfer):', gasEstimate.toString());
 
         const tx = await contract.transferWithAuthorization(
             from, to, safeBigValue, 0, safeValidBefore, safeNonce, safeV, safeR, safeS,
             { gasLimit: gasEstimate * 120n / 100n }
         );
-        console.log('[RELAY] TX送信:', tx.hash);
+        console.log('[RELAY] TX送信(transfer):', tx.hash);
 
         const receipt = await tx.wait(1);
-        console.log('[RELAY] TX確認:', receipt.hash, '/ status:', receipt.status);
+        console.log('[RELAY] TX確認(transfer):', receipt.hash, '/ status:', receipt.status);
 
         if (receipt.status !== 1) throw new Error(`TX失敗: ${receipt.hash}`);
 
+        const txHashShop = receipt.hash;
+
+        // ============================================================
+        // ⑨ ★ MassCon distribute() 自動実行（97%/2%/1%に分配）
+        // ============================================================
+        let txHashDist = '';
+        try {
+            console.log('[RELAY] distribute() 実行開始...');
+            const massCon     = new ethers.Contract(MASSCON_CONTRACT, MASSCON_ABI, wallet);
+            const gasEstDist  = await massCon.distribute.estimateGas();
+            console.log('[RELAY] ガス見積もり(distribute):', gasEstDist.toString());
+
+            const txDist      = await massCon.distribute(
+                { gasLimit: gasEstDist * 120n / 100n }
+            );
+            console.log('[RELAY] TX送信(distribute):', txDist.hash);
+
+            const receiptDist = await txDist.wait(1);
+            console.log('[RELAY] TX確認(distribute):', receiptDist.hash, '/ status:', receiptDist.status);
+
+            if (receiptDist.status === 1) {
+                txHashDist = receiptDist.hash;
+                console.log('[RELAY] ✅ distribute() 完了！97%/2%/1%分配済み');
+            } else {
+                console.warn('[RELAY] ⚠️ distribute() TX失敗（送金自体は成功）');
+            }
+        } catch (distErr) {
+            // distribute失敗でも送金成功を返す（分配は後で手動実行可能）
+            console.warn('[RELAY] ⚠️ distribute() エラー（送金は成功）:', distErr.message);
+        }
+
         return res.json({
             success:      true,
-            tx_hash_shop: receipt.hash,
-            tx_hash_dev:  '',
+            tx_hash_shop: txHashShop,
+            tx_hash_dev:  txHashDist,
         });
 
     } catch (err) {
@@ -229,7 +273,8 @@ app.post('/relay', authMiddleware, async (req, res) => {
 // サーバー起動
 // ============================================================
 app.listen(PORT, () => {
-    console.log(`[SERVER] JPYC Relayer v2.1.2 起動 port=${PORT}`);
+    console.log(`[SERVER] JPYC Relayer v2.2.0 起動 port=${PORT}`);
     console.log(`[SERVER] JPYC Contract : ${JPYC_CONTRACT}`);
+    console.log(`[SERVER] MassCon       : ${MASSCON_CONTRACT}`);
     console.log(`[SERVER] RPC           : ${RPC_URL}`);
 });
